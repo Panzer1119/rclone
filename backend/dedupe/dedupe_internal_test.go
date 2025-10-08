@@ -3,6 +3,7 @@ package dedupe
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"testing"
 	"time"
@@ -42,6 +43,7 @@ func TestInternalBasicOperations(t *testing.T) {
 // TestMetadataMarshalling tests metadata JSON encoding/decoding
 func TestMetadataMarshalling(t *testing.T) {
 	meta := &FileMetadata{
+		Version:   metadataVersion,
 		Name:      "test.txt",
 		Size:      1234,
 		ModTime:   time.Now(),
@@ -49,11 +51,20 @@ func TestMetadataMarshalling(t *testing.T) {
 		ChunkSize: 4194304,
 	}
 
-	// This would normally be tested with actual storage
-	// but we can at least verify the structure is sound
-	assert.NotEmpty(t, meta.Name)
-	assert.Greater(t, meta.Size, int64(0))
-	assert.Equal(t, 2, len(meta.Chunks))
+	// Test JSON marshalling/unmarshalling
+	data, err := json.Marshal(meta)
+	require.NoError(t, err)
+
+	var meta2 FileMetadata
+	err = json.Unmarshal(data, &meta2)
+	require.NoError(t, err)
+
+	// Verify fields
+	assert.Equal(t, meta.Version, meta2.Version)
+	assert.Equal(t, meta.Name, meta2.Name)
+	assert.Equal(t, meta.Size, meta2.Size)
+	assert.Equal(t, len(meta.Chunks), len(meta2.Chunks))
+	assert.Equal(t, meta.ChunkSize, meta2.ChunkSize)
 }
 
 // TestChunkReaderEmpty tests reading from empty metadata
@@ -172,4 +183,37 @@ func TestRabinChunkerLargeData(t *testing.T) {
 		// Log chunk sizes for analysis
 		t.Logf("Chunk sizes: %v", chunkSizes)
 	}
+}
+
+// TestVerifyHashOption tests the verify_hash configuration option
+func TestVerifyHashOption(t *testing.T) {
+	ctx := context.Background()
+
+	// Test with verify_hash disabled (default)
+	m1 := configmap.Simple{
+		"remote":      ":memory:",
+		"chunk_size":  "1M",
+		"verify_hash": "false",
+	}
+
+	f1, err := NewFs(ctx, "test", "", m1)
+	if err != nil {
+		t.Skip("Memory backend not available")
+		return
+	}
+	assert.False(t, f1.(*Fs).opt.VerifyHash)
+
+	// Test with verify_hash enabled
+	m2 := configmap.Simple{
+		"remote":      ":memory:",
+		"chunk_size":  "1M",
+		"verify_hash": "true",
+	}
+
+	f2, err := NewFs(ctx, "test", "", m2)
+	if err != nil {
+		t.Skip("Memory backend not available")
+		return
+	}
+	assert.True(t, f2.(*Fs).opt.VerifyHash)
 }

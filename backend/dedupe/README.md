@@ -36,6 +36,12 @@ rclone config create mydedup dedupe remote=myremote:path chunk_size=4M
 - `remote`: The underlying remote to store data (required)
 - `chunk_size`: Target size for chunks (default: 4M, min: 64K, max: 16M)
 - `hash_type`: Hash algorithm for chunk naming (default: sha256)
+- `verify_hash`: Perform bit-for-bit comparison when chunk hash matches (default: false, advanced)
+
+The `verify_hash` option adds extra data integrity checking. When enabled, if a chunk 
+with the same hash already exists, the backend will read the existing chunk and compare 
+it byte-by-byte with the new chunk data. This protects against the extremely unlikely 
+case of hash collisions but adds I/O overhead.
 
 ## Use Cases
 
@@ -90,6 +96,7 @@ The backend uses Rabin fingerprinting with:
 File metadata is stored as JSON:
 ```json
 {
+  "version": 1,
   "name": "path/to/file.txt",
   "size": 1234567,
   "modTime": "2024-01-01T12:00:00Z",
@@ -100,6 +107,9 @@ File metadata is stored as JSON:
   "chunkSize": 4194304
 }
 ```
+
+The `version` field allows for future metadata format changes while maintaining 
+backward compatibility.
 
 ## Combining with Other Backends
 

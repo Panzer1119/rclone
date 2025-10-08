@@ -2,6 +2,7 @@
 package dedupe
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -39,6 +40,9 @@ const (
 	// Directory names in the underlying storage
 	chunksDir   = ".dedupe/chunks"
 	metadataDir = ".dedupe/metadata"
+
+	// Metadata format version
+	metadataVersion = 1
 )
 
 var (
@@ -75,15 +79,26 @@ Actual chunk sizes will vary around this target size.`,
 				Value: "sha256",
 				Help:  "SHA256 for chunk naming (recommended)",
 			}},
+		}, {
+			Name:     "verify_hash",
+			Advanced: true,
+			Default:  false,
+			Help: `Perform bit-for-bit comparison when chunk hash matches.
+
+When enabled, if a chunk with the same hash already exists, the new chunk 
+data will be compared byte-by-byte with the existing chunk to verify they 
+are truly identical. This adds overhead but provides extra data integrity 
+checking against hash collisions.`,
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote    string        `config:"remote"`
-	ChunkSize fs.SizeSuffix `config:"chunk_size"`
-	HashType  string        `config:"hash_type"`
+	Remote     string        `config:"remote"`
+	ChunkSize  fs.SizeSuffix `config:"chunk_size"`
+	HashType   string        `config:"hash_type"`
+	VerifyHash bool          `config:"verify_hash"`
 }
 
 // Fs represents a dedupe filesystem
@@ -101,6 +116,7 @@ type Fs struct {
 
 // FileMetadata stores metadata about a file's chunks
 type FileMetadata struct {
+	Version   int       `json:"version"`
 	Name      string    `json:"name"`
 	Size      int64     `json:"size"`
 	ModTime   time.Time `json:"modTime"`
@@ -412,6 +428,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	// Create metadata
 	o.metadata = &FileMetadata{
+		Version:   metadataVersion,
 		Name:      o.remote,
 		Size:      src.Size(),
 		ModTime:   src.ModTime(ctx),
@@ -474,9 +491,16 @@ func (f *Fs) storeChunk(ctx context.Context, hash string, data []byte) error {
 	chunkPath := path.Join(chunksDir, hash[:2], hash)
 
 	// Check if chunk already exists
-	_, err := f.base.NewObject(ctx, chunkPath)
+	existingObj, err := f.base.NewObject(ctx, chunkPath)
 	if err == nil {
-		// Chunk already exists, skip
+		// Chunk already exists
+		if f.opt.VerifyHash {
+			// Perform bit-for-bit comparison
+			if err := f.verifyChunkData(ctx, existingObj, data); err != nil {
+				return fmt.Errorf("chunk verification failed for %s: %w", hash, err)
+			}
+		}
+		// Chunk exists and is verified (if requested), skip storing
 		return nil
 	}
 
@@ -490,6 +514,34 @@ func (f *Fs) storeChunk(ctx context.Context, hash string, data []byte) error {
 
 	_, err = f.base.Put(ctx, reader, info)
 	return err
+}
+
+// verifyChunkData performs a bit-for-bit comparison between existing chunk and new data
+func (f *Fs) verifyChunkData(ctx context.Context, existingObj fs.Object, newData []byte) error {
+	// Open existing chunk
+	rc, err := existingObj.Open(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to open existing chunk: %w", err)
+	}
+	defer rc.Close()
+
+	// Read existing chunk data
+	existingData, err := io.ReadAll(rc)
+	if err != nil {
+		return fmt.Errorf("failed to read existing chunk: %w", err)
+	}
+
+	// Compare sizes first
+	if len(existingData) != len(newData) {
+		return fmt.Errorf("chunk size mismatch: existing %d bytes, new %d bytes", len(existingData), len(newData))
+	}
+
+	// Bit-for-bit comparison
+	if !bytes.Equal(existingData, newData) {
+		return errors.New("chunk data mismatch despite matching hash (possible hash collision)")
+	}
+
+	return nil
 }
 
 // rabinChunker implements content-defined chunking using Rabin fingerprinting
