@@ -70,6 +70,12 @@ rclone ls mydedup:
 
 # Sync files
 rclone sync /local/files mydedup:
+
+# Run garbage collection to remove orphaned chunks
+rclone backend gc mydedup:
+
+# Dry-run to see what would be deleted
+rclone backend gc mydedup: -o dry-run=true
 ```
 
 ## Performance Considerations
@@ -81,10 +87,28 @@ rclone sync /local/files mydedup:
 
 ## Limitations
 
-- **No Garbage Collection**: Deleted file chunks remain in storage (manual cleanup needed)
+- ~~No Garbage Collection~~: ✅ Now available via `rclone backend gc` command to clean up orphaned chunks
 - **Metadata Size**: Each file requires a metadata object
 - **Chunk Overhead**: Small files still create metadata overhead
 - **No Encryption**: Data is stored as-is (combine with crypt backend if needed)
+
+## Garbage Collection
+
+The backend includes a garbage collection command to remove orphaned chunks:
+
+```bash
+# Run GC to delete chunks no longer referenced by any file
+rclone backend gc mydedup:
+
+# Dry-run to see what would be deleted without actually deleting
+rclone backend gc mydedup: -o dry-run=true
+```
+
+The GC process:
+1. Scans all metadata files to build a set of referenced chunks
+2. Scans all stored chunks to identify orphans
+3. Deletes chunks that are not referenced (unless in dry-run mode)
+4. Returns statistics about the operation
 
 ## Technical Details
 

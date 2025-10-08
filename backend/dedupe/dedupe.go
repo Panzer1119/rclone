@@ -22,6 +22,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fspath"
 	fshash "github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/walk"
 )
 
 const (
@@ -57,6 +58,7 @@ func init() {
 		Name:        "dedupe",
 		Description: "Deduplicate files using content-defined chunking",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
 		Options: []fs.Option{{
 			Name:     "remote",
 			Required: true,
@@ -765,3 +767,136 @@ var (
 	_ fs.Fs     = (*Fs)(nil)
 	_ fs.Object = (*Object)(nil)
 )
+
+// commandHelp describes the available backend commands
+var commandHelp = []fs.CommandHelp{{
+	Name:  "gc",
+	Short: "Run garbage collection on orphaned chunks",
+	Long: `This command scans all metadata files and identifies chunks that are no longer
+referenced by any file. Orphaned chunks are then deleted from storage.
+
+Usage:
+    rclone backend gc dedupe:
+
+Options:
+    --dry-run: Show what would be deleted without actually deleting
+`,
+	Opts: map[string]string{
+		"dry-run": "Set to true to show what would be deleted without deleting",
+	},
+}}
+
+// Command runs a backend command
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	switch name {
+	case "gc":
+		dryRun := opt["dry-run"] == "true"
+		stats, err := f.garbageCollect(ctx, dryRun)
+		if err != nil {
+			return nil, err
+		}
+		return stats, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
+// GCStats holds statistics from garbage collection
+type GCStats struct {
+	MetadataFiles int      `json:"metadataFiles"`
+	ReferencedChunks int   `json:"referencedChunks"`
+	TotalChunks   int      `json:"totalChunks"`
+	OrphanedChunks int     `json:"orphanedChunks"`
+	DeletedChunks int      `json:"deletedChunks"`
+	Errors        []string `json:"errors,omitempty"`
+}
+
+// garbageCollect performs garbage collection on orphaned chunks
+func (f *Fs) garbageCollect(ctx context.Context, dryRun bool) (*GCStats, error) {
+	stats := &GCStats{}
+	
+	// Step 1: Build set of all referenced chunks from metadata files
+	referencedChunks := make(map[string]bool)
+	
+	fs.Infof(f, "Scanning metadata files...")
+	err := walk.ListR(ctx, f.base, metadataDir, true, -1, walk.ListAll, func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			if o, ok := entry.(fs.Object); ok {
+				stats.MetadataFiles++
+				
+				// Load metadata
+				rc, err := o.Open(ctx)
+				if err != nil {
+					stats.Errors = append(stats.Errors, fmt.Sprintf("Failed to open %s: %v", o.Remote(), err))
+					continue
+				}
+				
+				var meta FileMetadata
+				if err := json.NewDecoder(rc).Decode(&meta); err != nil {
+					rc.Close()
+					stats.Errors = append(stats.Errors, fmt.Sprintf("Failed to parse %s: %v", o.Remote(), err))
+					continue
+				}
+				rc.Close()
+				
+				// Mark all chunks as referenced
+				for _, chunkHash := range meta.Chunks {
+					referencedChunks[chunkHash] = true
+				}
+			}
+		}
+		return nil
+	})
+	
+	if err != nil {
+		return stats, fmt.Errorf("failed to scan metadata: %w", err)
+	}
+	
+	stats.ReferencedChunks = len(referencedChunks)
+	fs.Infof(f, "Found %d referenced chunks from %d metadata files", stats.ReferencedChunks, stats.MetadataFiles)
+	
+	// Step 2: Scan all chunks and identify orphans
+	fs.Infof(f, "Scanning chunk storage...")
+	err = walk.ListR(ctx, f.base, chunksDir, true, -1, walk.ListAll, func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			if o, ok := entry.(fs.Object); ok {
+				stats.TotalChunks++
+				
+				// Extract chunk hash from path (e.g., .dedupe/chunks/ab/abc123... -> abc123...)
+				chunkPath := o.Remote()
+				parts := strings.Split(chunkPath, "/")
+				if len(parts) < 3 {
+					continue
+				}
+				chunkHash := parts[len(parts)-1]
+				
+				// Check if this chunk is referenced
+				if !referencedChunks[chunkHash] {
+					stats.OrphanedChunks++
+					
+					if !dryRun {
+						// Delete the orphaned chunk
+						if err := o.Remove(ctx); err != nil {
+							stats.Errors = append(stats.Errors, fmt.Sprintf("Failed to delete %s: %v", chunkPath, err))
+						} else {
+							stats.DeletedChunks++
+						}
+					}
+				}
+			}
+		}
+		return nil
+	})
+	
+	if err != nil {
+		return stats, fmt.Errorf("failed to scan chunks: %w", err)
+	}
+	
+	if dryRun {
+		fs.Infof(f, "DRY RUN: Would delete %d orphaned chunks out of %d total chunks", stats.OrphanedChunks, stats.TotalChunks)
+	} else {
+		fs.Infof(f, "Deleted %d orphaned chunks out of %d total chunks", stats.DeletedChunks, stats.TotalChunks)
+	}
+	
+	return stats, nil
+}
