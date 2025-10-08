@@ -49,7 +49,7 @@ func TestMetadataMarshalling(t *testing.T) {
 		ModTime:   time.Now(),
 		Chunks:    []string{"abc123", "def456"},
 		ChunkSize: 4194304,
-		Hash:      "fedcba9876543210", // Optional full file hash
+		Hashes:    map[string]string{"sha256": "fedcba9876543210"}, // Optional full file hashes
 	}
 
 	// Test JSON marshalling/unmarshalling
@@ -66,7 +66,7 @@ func TestMetadataMarshalling(t *testing.T) {
 	assert.Equal(t, meta.Size, meta2.Size)
 	assert.Equal(t, len(meta.Chunks), len(meta2.Chunks))
 	assert.Equal(t, meta.ChunkSize, meta2.ChunkSize)
-	assert.Equal(t, meta.Hash, meta2.Hash)
+	assert.Equal(t, meta.Hashes["sha256"], meta2.Hashes["sha256"])
 }
 
 // TestChunkReaderEmpty tests reading from empty metadata

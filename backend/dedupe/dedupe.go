@@ -101,9 +101,20 @@ checking against hash collisions.`,
 			Default:  true,
 			Help: `Store hash of the complete file in metadata.
 
-When enabled, the hash of the entire file is calculated and stored in the 
-metadata. This allows the backend to provide the file hash immediately 
+When enabled, hashes of the entire file are calculated and stored in the 
+metadata. This allows the backend to provide file hashes immediately 
 without having to read and reconstruct the file from chunks.`,
+		}, {
+			Name:     "hash_types",
+			Advanced: true,
+			Default:  "sha256",
+			Help: `Comma-separated list of hash types to calculate and store for complete files.
+
+Available: md5, sha1, sha256
+Default: sha256 only
+Example: "sha256,sha1" or "sha256,sha1,md5"
+
+SHA256 is always calculated for chunk naming regardless of this setting.`,
 		}, {
 			Name:     "use_chunk_cache",
 			Advanced: true,
@@ -124,6 +135,7 @@ type Options struct {
 	HashType      string        `config:"hash_type"`
 	VerifyHash    bool          `config:"verify_hash"`
 	StoreFullHash bool          `config:"store_full_hash"`
+	HashTypes     string        `config:"hash_types"`
 	UseChunkCache bool          `config:"use_chunk_cache"`
 }
 
@@ -134,6 +146,9 @@ type Fs struct {
 	opt      Options     // Parsed options
 	features *fs.Features // Optional features
 	base     fs.Fs       // Underlying remote
+	
+	// Hash types to calculate for full files
+	fullHashTypes []fshash.Type
 	
 	// Metadata cache
 	metaMu    sync.RWMutex
@@ -151,7 +166,6 @@ type FileMetadata struct {
 	ModTime   time.Time          `json:"modTime"`
 	Chunks    []string           `json:"chunks"` // List of chunk hashes
 	ChunkSize int64              `json:"chunkSize"`
-	Hash      string             `json:"hash,omitempty"`  // SHA256 hash of complete file (deprecated, use Hashes)
 	Hashes    map[string]string  `json:"hashes,omitempty"` // Multiple hashes of complete file (e.g., "md5": "...", "sha1": "...", "sha256": "...")
 }
 
@@ -204,6 +218,31 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 		base:      baseFs,
 		metaCache: make(map[string]*FileMetadata),
 	}
+	
+	// Parse hash types to calculate for full files
+	if opt.StoreFullHash {
+		hashTypesStr := strings.ToLower(strings.TrimSpace(opt.HashTypes))
+		if hashTypesStr == "" {
+			hashTypesStr = "sha256" // Default
+		}
+		hashTypeNames := strings.Split(hashTypesStr, ",")
+		for _, name := range hashTypeNames {
+			name = strings.TrimSpace(name)
+			switch name {
+			case "md5":
+				f.fullHashTypes = append(f.fullHashTypes, fshash.MD5)
+			case "sha1":
+				f.fullHashTypes = append(f.fullHashTypes, fshash.SHA1)
+			case "sha256":
+				f.fullHashTypes = append(f.fullHashTypes, fshash.SHA256)
+			default:
+				return nil, fmt.Errorf("unsupported hash type: %s (supported: md5, sha1, sha256)", name)
+			}
+		}
+		if len(f.fullHashTypes) == 0 {
+			f.fullHashTypes = []fshash.Type{fshash.SHA256} // Default to SHA256
+		}
+	}
 
 	// Initialize chunk hash cache if enabled
 	if opt.UseChunkCache && kv.Supported() {
@@ -249,9 +288,9 @@ func (f *Fs) Precision() time.Duration {
 
 // Hashes returns the supported hash sets
 func (f *Fs) Hashes() fshash.Set {
-	// Support SHA1 and SHA256 by default when store_full_hash is enabled
-	if f.opt.StoreFullHash {
-		return fshash.NewHashSet(fshash.MD5, fshash.SHA1, fshash.SHA256)
+	// Return configured hash types when store_full_hash is enabled
+	if f.opt.StoreFullHash && len(f.fullHashTypes) > 0 {
+		return fshash.NewHashSet(f.fullHashTypes...)
 	}
 	// Without stored hashes, we can only provide SHA256 from chunk hashes
 	return fshash.NewHashSet(fshash.SHA256)
@@ -427,17 +466,12 @@ func (o *Object) Hash(ctx context.Context, ht fshash.Type) (string, error) {
 		return "", errors.New("no metadata available")
 	}
 	
-	// Try to get hash from metadata Hashes map first
+	// Try to get hash from metadata Hashes map
 	if o.metadata.Hashes != nil {
 		hashName := ht.String()
 		if hashVal, ok := o.metadata.Hashes[hashName]; ok && hashVal != "" {
 			return hashVal, nil
 		}
-	}
-	
-	// Backward compatibility: check old Hash field for SHA256
-	if ht == fshash.SHA256 && o.metadata.Hash != "" {
-		return o.metadata.Hash, nil
 	}
 	
 	// For SHA256, we can compute from chunk hashes as fallback
@@ -494,8 +528,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		ModTime:   src.ModTime(ctx),
 		Chunks:    result.Chunks,
 		ChunkSize: int64(o.fs.opt.ChunkSize),
-		Hash:      result.FullHash,   // Backward compatibility
-		Hashes:    result.FullHashes,  // New multi-hash support
+		Hashes:    result.FullHashes,  // Multi-hash support
 	}
 	o.size = src.Size()
 	o.modTime = src.ModTime(ctx)
@@ -521,7 +554,6 @@ func (o *Object) Remove(ctx context.Context) error {
 // chunkResult holds the result of chunking operation
 type chunkResult struct {
 	Chunks     []string
-	FullHash   string            // Deprecated: use FullHashes
 	FullHashes map[string]string // Multiple hashes of the complete file
 }
 
@@ -530,12 +562,18 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) 
 	var chunks []string
 	var hashers map[fshash.Type]hash.Hash
 	
-	// Initialize multiple file hashers if option is enabled
-	if f.opt.StoreFullHash {
-		hashers = map[fshash.Type]hash.Hash{
-			fshash.MD5:    md5.New(),
-			fshash.SHA1:   sha1.New(),
-			fshash.SHA256: sha256.New(),
+	// Initialize file hashers for configured hash types if option is enabled
+	if f.opt.StoreFullHash && len(f.fullHashTypes) > 0 {
+		hashers = make(map[fshash.Type]hash.Hash)
+		for _, ht := range f.fullHashTypes {
+			switch ht {
+			case fshash.MD5:
+				hashers[ht] = md5.New()
+			case fshash.SHA1:
+				hashers[ht] = sha1.New()
+			case fshash.SHA256:
+				hashers[ht] = sha256.New()
+			}
 		}
 	}
 	
@@ -584,11 +622,6 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) 
 		for ht, hasher := range hashers {
 			hashValue := hex.EncodeToString(hasher.Sum(nil))
 			result.FullHashes[ht.String()] = hashValue
-			
-			// Also set FullHash field for backward compatibility (SHA256)
-			if ht == fshash.SHA256 {
-				result.FullHash = hashValue
-			}
 		}
 	}
 	

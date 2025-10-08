@@ -37,16 +37,25 @@ rclone config create mydedup dedupe remote=myremote:path chunk_size=4M
 - `chunk_size`: Target size for chunks (default: 4M, min: 64K, max: 16M)
 - `hash_type`: Hash algorithm for chunk naming (default: sha256)
 - `store_full_hash`: Store hashes of complete file in metadata (default: true)
+- `hash_types`: Hash types to calculate for complete files (default: sha256, advanced)
 - `use_chunk_cache`: Use local persistent cache for chunk hashes (default: true, advanced)
 - `verify_hash`: Perform bit-for-bit comparison when chunk hash matches (default: false, advanced)
 
-The `store_full_hash` option (enabled by default) calculates and stores multiple hashes 
-(MD5, SHA1, SHA256) of the entire file in the metadata during upload. This allows the 
-backend to immediately provide file hashes when requested by upper layers, without having 
-to read and reconstruct the file from chunks. The backend supports:
-- **MD5**: For compatibility with many cloud storage providers
+The `store_full_hash` option (enabled by default) calculates and stores hashes of the 
+entire file in the metadata during upload. This allows the backend to immediately provide 
+file hashes when requested by upper layers, without having to read and reconstruct the 
+file from chunks.
+
+The `hash_types` option (advanced) controls which hash algorithms are calculated and stored:
+- Default: `sha256` only (minimal metadata, good performance)
+- Options: `md5`, `sha1`, `sha256` (comma-separated)
+- Example: `sha256,sha1` or `sha256,sha1,md5`
+- **Note**: SHA256 is always calculated for chunk naming regardless of this setting
+
+Supported hash types:
+- **SHA256**: Cryptographically strong hash (always used for chunk naming)
 - **SHA1**: Common hash type supported by many systems
-- **SHA256**: Cryptographically strong hash (also used for chunk naming)
+- **MD5**: For compatibility with many cloud storage providers
 
 The `use_chunk_cache` option (enabled by default) maintains a local persistent database  
 (using BoltDB) of known chunk hashes. When uploading files, the backend first checks this
@@ -166,14 +175,17 @@ File metadata is stored as JSON:
     "def456..."
   ],
   "chunkSize": 4194304,
-  "hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  "hashes": {
+    "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+  }
 }
 ```
 
 The `version` field allows for future metadata format changes while maintaining 
-backward compatibility. The `hash` field (when `store_full_hash` is enabled) 
-contains the SHA256 hash of the complete file, allowing fast hash retrieval 
-without reconstructing the file from chunks.
+backward compatibility. The `hashes` field (when `store_full_hash` is enabled) 
+contains the configured hash types of the complete file, allowing fast hash retrieval 
+without reconstructing the file from chunks. Only the requested hash types (via 
+`hash_types` option) are stored to minimize metadata size.
 
 ## Combining with Other Backends
 
