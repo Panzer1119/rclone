@@ -4,6 +4,8 @@ package dedupe
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -143,13 +145,14 @@ type Fs struct {
 
 // FileMetadata stores metadata about a file's chunks
 type FileMetadata struct {
-	Version   int       `json:"version"`
-	Name      string    `json:"name"`
-	Size      int64     `json:"size"`
-	ModTime   time.Time `json:"modTime"`
-	Chunks    []string  `json:"chunks"` // List of chunk hashes
-	ChunkSize int64     `json:"chunkSize"`
-	Hash      string    `json:"hash,omitempty"` // Hash of complete file (optional)
+	Version   int                `json:"version"`
+	Name      string             `json:"name"`
+	Size      int64              `json:"size"`
+	ModTime   time.Time          `json:"modTime"`
+	Chunks    []string           `json:"chunks"` // List of chunk hashes
+	ChunkSize int64              `json:"chunkSize"`
+	Hash      string             `json:"hash,omitempty"`  // SHA256 hash of complete file (deprecated, use Hashes)
+	Hashes    map[string]string  `json:"hashes,omitempty"` // Multiple hashes of complete file (e.g., "md5": "...", "sha1": "...", "sha256": "...")
 }
 
 // Object represents a dedupe object
@@ -246,6 +249,11 @@ func (f *Fs) Precision() time.Duration {
 
 // Hashes returns the supported hash sets
 func (f *Fs) Hashes() fshash.Set {
+	// Support SHA1 and SHA256 by default when store_full_hash is enabled
+	if f.opt.StoreFullHash {
+		return fshash.NewHashSet(fshash.MD5, fshash.SHA1, fshash.SHA256)
+	}
+	// Without stored hashes, we can only provide SHA256 from chunk hashes
 	return fshash.NewHashSet(fshash.SHA256)
 }
 
@@ -415,26 +423,34 @@ func (o *Object) Size() int64 {
 
 // Hash returns the hash of the object
 func (o *Object) Hash(ctx context.Context, ht fshash.Type) (string, error) {
-	if ht != fshash.SHA256 {
-		return "", fshash.ErrUnsupported
-	}
-	
 	if o.metadata == nil {
 		return "", errors.New("no metadata available")
 	}
 	
-	// Return stored full file hash if available
-	if o.metadata.Hash != "" {
+	// Try to get hash from metadata Hashes map first
+	if o.metadata.Hashes != nil {
+		hashName := ht.String()
+		if hashVal, ok := o.metadata.Hashes[hashName]; ok && hashVal != "" {
+			return hashVal, nil
+		}
+	}
+	
+	// Backward compatibility: check old Hash field for SHA256
+	if ht == fshash.SHA256 && o.metadata.Hash != "" {
 		return o.metadata.Hash, nil
 	}
 	
-	// Fallback: compute hash from chunk hashes
-	h := sha256.New()
-	for _, chunkHash := range o.metadata.Chunks {
-		h.Write([]byte(chunkHash))
+	// For SHA256, we can compute from chunk hashes as fallback
+	if ht == fshash.SHA256 {
+		h := sha256.New()
+		for _, chunkHash := range o.metadata.Chunks {
+			h.Write([]byte(chunkHash))
+		}
+		return hex.EncodeToString(h.Sum(nil)), nil
 	}
 	
-	return hex.EncodeToString(h.Sum(nil)), nil
+	// Hash type not supported or not stored
+	return "", fshash.ErrUnsupported
 }
 
 // SetModTime sets the modification time
@@ -478,7 +494,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		ModTime:   src.ModTime(ctx),
 		Chunks:    result.Chunks,
 		ChunkSize: int64(o.fs.opt.ChunkSize),
-		Hash:      result.FullHash,
+		Hash:      result.FullHash,   // Backward compatibility
+		Hashes:    result.FullHashes,  // New multi-hash support
 	}
 	o.size = src.Size()
 	o.modTime = src.ModTime(ctx)
@@ -503,24 +520,34 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // chunkResult holds the result of chunking operation
 type chunkResult struct {
-	Chunks   []string
-	FullHash string
+	Chunks     []string
+	FullHash   string            // Deprecated: use FullHashes
+	FullHashes map[string]string // Multiple hashes of the complete file
 }
 
 // chunkData splits input data into content-defined chunks and stores them
 func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) {
 	var chunks []string
-	var fullHasher hash.Hash
+	var hashers map[fshash.Type]hash.Hash
 	
-	// Initialize full file hasher if option is enabled
+	// Initialize multiple file hashers if option is enabled
 	if f.opt.StoreFullHash {
-		fullHasher = sha256.New()
+		hashers = map[fshash.Type]hash.Hash{
+			fshash.MD5:    md5.New(),
+			fshash.SHA1:   sha1.New(),
+			fshash.SHA256: sha256.New(),
+		}
 	}
 	
-	// Use TeeReader to hash the full file while chunking
+	// Use multiWriter to hash the full file with multiple algorithms while chunking
 	var reader io.Reader = in
-	if fullHasher != nil {
-		reader = io.TeeReader(in, fullHasher)
+	if hashers != nil {
+		writers := make([]io.Writer, 0, len(hashers))
+		for _, h := range hashers {
+			writers = append(writers, h)
+		}
+		multiWriter := io.MultiWriter(writers...)
+		reader = io.TeeReader(in, multiWriter)
 	}
 	
 	chunker := newRabinChunker(reader, int(f.opt.ChunkSize))
@@ -534,7 +561,7 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) 
 			return nil, err
 		}
 
-		// Hash the chunk
+		// Hash the chunk with SHA256 for storage naming
 		h := sha256.New()
 		h.Write(chunk)
 		chunkHash := hex.EncodeToString(h.Sum(nil))
@@ -551,11 +578,20 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) 
 		Chunks: chunks,
 	}
 	
-	// Store full file hash if enabled
-	if fullHasher != nil {
-		result.FullHash = hex.EncodeToString(fullHasher.Sum(nil))
+	// Store full file hashes if enabled
+	if hashers != nil {
+		result.FullHashes = make(map[string]string)
+		for ht, hasher := range hashers {
+			hashValue := hex.EncodeToString(hasher.Sum(nil))
+			result.FullHashes[ht.String()] = hashValue
+			
+			// Also set FullHash field for backward compatibility (SHA256)
+			if ht == fshash.SHA256 {
+				result.FullHash = hashValue
+			}
+		}
 	}
-
+	
 	return result, nil
 }
 
@@ -1003,7 +1039,16 @@ func (f *Fs) garbageCollect(ctx context.Context, dryRun, syncCache bool) (*GCSta
 							stats.Errors = append(stats.Errors, fmt.Sprintf("Failed to delete %s: %v", chunkPath, err))
 						} else {
 							stats.DeletedChunks++
+							// Also remove from cache if present
+							if f.chunkDB != nil {
+								f.removeChunkFromCache(ctx, chunkHash)
+							}
 						}
+					}
+				} else {
+					// Chunk is referenced, add to cache if not already there
+					if f.chunkDB != nil && !dryRun {
+						f.addChunkToCache(ctx, chunkHash)
 					}
 				}
 			}

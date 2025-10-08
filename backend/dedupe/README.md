@@ -36,14 +36,17 @@ rclone config create mydedup dedupe remote=myremote:path chunk_size=4M
 - `remote`: The underlying remote to store data (required)
 - `chunk_size`: Target size for chunks (default: 4M, min: 64K, max: 16M)
 - `hash_type`: Hash algorithm for chunk naming (default: sha256)
-- `store_full_hash`: Store hash of complete file in metadata (default: true)
+- `store_full_hash`: Store hashes of complete file in metadata (default: true)
 - `use_chunk_cache`: Use local persistent cache for chunk hashes (default: true, advanced)
 - `verify_hash`: Perform bit-for-bit comparison when chunk hash matches (default: false, advanced)
 
-The `store_full_hash` option (enabled by default) calculates and stores the hash of 
-the entire file in the metadata during upload. This allows the backend to immediately 
-provide the file hash when requested by upper layers, without having to read and 
-reconstruct the file from chunks.
+The `store_full_hash` option (enabled by default) calculates and stores multiple hashes 
+(MD5, SHA1, SHA256) of the entire file in the metadata during upload. This allows the 
+backend to immediately provide file hashes when requested by upper layers, without having 
+to read and reconstruct the file from chunks. The backend supports:
+- **MD5**: For compatibility with many cloud storage providers
+- **SHA1**: Common hash type supported by many systems
+- **SHA256**: Cryptographically strong hash (also used for chunk naming)
 
 The `use_chunk_cache` option (enabled by default) maintains a local persistent database  
 (using BoltDB) of known chunk hashes. When uploading files, the backend first checks this
@@ -118,8 +121,13 @@ The GC process:
 1. Scans all metadata files to build a set of referenced chunks
 2. Scans all stored chunks to identify orphans
 3. Deletes chunks that are not referenced (unless in dry-run mode)
-4. Optionally synchronizes the chunk cache to remove stale entries
-5. Returns statistics about the operation
+4. **Adds referenced chunks to the local cache** (if cache is enabled)
+5. Optionally synchronizes the chunk cache to remove stale entries
+6. Returns statistics about the operation
+
+**Note**: Garbage collection now automatically populates the chunk cache with all 
+referenced chunks it discovers during the scan. This helps rebuild the cache if it 
+becomes stale or is cleared.
 
 ## Chunk Hash Cache
 
