@@ -23,6 +23,7 @@ import (
 	"github.com/rclone/rclone/fs/fspath"
 	fshash "github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/walk"
+	"github.com/rclone/rclone/lib/kv"
 )
 
 const (
@@ -101,6 +102,15 @@ checking against hash collisions.`,
 When enabled, the hash of the entire file is calculated and stored in the 
 metadata. This allows the backend to provide the file hash immediately 
 without having to read and reconstruct the file from chunks.`,
+		}, {
+			Name:     "use_chunk_cache",
+			Advanced: true,
+			Default:  true,
+			Help: `Use local persistent cache for chunk hashes.
+
+When enabled, maintains a local database of known chunk hashes to avoid
+checking the underlying storage for every chunk. Significantly improves
+upload performance for files with many chunks.`,
 		}},
 	})
 }
@@ -112,6 +122,7 @@ type Options struct {
 	HashType      string        `config:"hash_type"`
 	VerifyHash    bool          `config:"verify_hash"`
 	StoreFullHash bool          `config:"store_full_hash"`
+	UseChunkCache bool          `config:"use_chunk_cache"`
 }
 
 // Fs represents a dedupe filesystem
@@ -125,6 +136,9 @@ type Fs struct {
 	// Metadata cache
 	metaMu    sync.RWMutex
 	metaCache map[string]*FileMetadata
+	
+	// Chunk hash cache (persistent local database)
+	chunkDB *kv.DB
 }
 
 // FileMetadata stores metadata about a file's chunks
@@ -186,6 +200,17 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 		opt:       *opt,
 		base:      baseFs,
 		metaCache: make(map[string]*FileMetadata),
+	}
+
+	// Initialize chunk hash cache if enabled
+	if opt.UseChunkCache && kv.Supported() {
+		db, err := kv.Start(ctx, "dedupe-chunks", baseFs)
+		if err != nil {
+			fs.Logf(f, "Failed to start chunk cache database: %v (continuing without cache)", err)
+		} else {
+			f.chunkDB = db
+			fs.Debugf(f, "Chunk hash cache enabled at: %s", db.Path())
+		}
 	}
 
 	// Set up features
@@ -538,7 +563,15 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) 
 func (f *Fs) storeChunk(ctx context.Context, hash string, data []byte) error {
 	chunkPath := path.Join(chunksDir, hash[:2], hash)
 
-	// Check if chunk already exists
+	// Check chunk cache first if enabled
+	if f.chunkDB != nil {
+		if f.chunkExistsInCache(ctx, hash) {
+			fs.Debugf(hash, "Chunk found in cache, skipping upload")
+			return nil
+		}
+	}
+
+	// Check if chunk already exists in storage
 	existingObj, err := f.base.NewObject(ctx, chunkPath)
 	if err == nil {
 		// Chunk already exists
@@ -547,6 +580,10 @@ func (f *Fs) storeChunk(ctx context.Context, hash string, data []byte) error {
 			if err := f.verifyChunkData(ctx, existingObj, data); err != nil {
 				return fmt.Errorf("chunk verification failed for %s: %w", hash, err)
 			}
+		}
+		// Add to cache for future use
+		if f.chunkDB != nil {
+			f.addChunkToCache(ctx, hash)
 		}
 		// Chunk exists and is verified (if requested), skip storing
 		return nil
@@ -561,7 +598,16 @@ func (f *Fs) storeChunk(ctx context.Context, hash string, data []byte) error {
 	}
 
 	_, err = f.base.Put(ctx, reader, info)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Add to cache after successful upload
+	if f.chunkDB != nil {
+		f.addChunkToCache(ctx, hash)
+	}
+
+	return nil
 }
 
 // verifyChunkData performs a bit-for-bit comparison between existing chunk and new data
@@ -590,6 +636,77 @@ func (f *Fs) verifyChunkData(ctx context.Context, existingObj fs.Object, newData
 	}
 
 	return nil
+}
+
+// chunkCacheOp represents a chunk cache database operation
+type chunkCacheOp struct {
+	key   string
+	value []byte
+}
+
+func (op *chunkCacheOp) Do(ctx context.Context, b kv.Bucket) error {
+	if op.value == nil {
+		// Delete operation
+		return b.Delete([]byte(op.key))
+	}
+	// Put operation
+	return b.Put([]byte(op.key), op.value)
+}
+
+// chunkExistsInCache checks if a chunk hash exists in the local cache
+func (f *Fs) chunkExistsInCache(ctx context.Context, hash string) bool {
+	if f.chunkDB == nil {
+		return false
+	}
+
+	var exists bool
+	getter := &chunkCacheGetter{key: hash, exists: &exists}
+	err := f.chunkDB.Do(false, getter)
+	if err != nil {
+		fs.Debugf(hash, "Failed to check chunk cache: %v", err)
+		return false
+	}
+	return exists
+}
+
+// chunkCacheGetter checks if a key exists in the cache
+type chunkCacheGetter struct {
+	key    string
+	exists *bool
+}
+
+func (op *chunkCacheGetter) Do(ctx context.Context, b kv.Bucket) error {
+	val := b.Get([]byte(op.key))
+	*op.exists = val != nil
+	return nil
+}
+
+// addChunkToCache adds a chunk hash to the local cache
+func (f *Fs) addChunkToCache(ctx context.Context, hash string) {
+	if f.chunkDB == nil {
+		return
+	}
+
+	// Store a simple marker (timestamp) to indicate chunk exists
+	timestamp := []byte(time.Now().Format(time.RFC3339))
+	op := &chunkCacheOp{key: hash, value: timestamp}
+	err := f.chunkDB.Do(true, op)
+	if err != nil {
+		fs.Debugf(hash, "Failed to add chunk to cache: %v", err)
+	}
+}
+
+// removeChunkFromCache removes a chunk hash from the local cache
+func (f *Fs) removeChunkFromCache(ctx context.Context, hash string) {
+	if f.chunkDB == nil {
+		return
+	}
+
+	op := &chunkCacheOp{key: hash, value: nil}
+	err := f.chunkDB.Do(true, op)
+	if err != nil {
+		fs.Debugf(hash, "Failed to remove chunk from cache: %v", err)
+	}
 }
 
 // rabinChunker implements content-defined chunking using Rabin fingerprinting
@@ -780,9 +897,11 @@ Usage:
 
 Options:
     --dry-run: Show what would be deleted without actually deleting
+    --sync-cache: Synchronize chunk cache with actual storage (removes stale entries)
 `,
 	Opts: map[string]string{
-		"dry-run": "Set to true to show what would be deleted without deleting",
+		"dry-run":    "Set to true to show what would be deleted without deleting",
+		"sync-cache": "Set to true to also clean up the chunk cache",
 	},
 }}
 
@@ -791,7 +910,8 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	switch name {
 	case "gc":
 		dryRun := opt["dry-run"] == "true"
-		stats, err := f.garbageCollect(ctx, dryRun)
+		syncCache := opt["sync-cache"] == "true"
+		stats, err := f.garbageCollect(ctx, dryRun, syncCache)
 		if err != nil {
 			return nil, err
 		}
@@ -803,16 +923,19 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 
 // GCStats holds statistics from garbage collection
 type GCStats struct {
-	MetadataFiles int      `json:"metadataFiles"`
-	ReferencedChunks int   `json:"referencedChunks"`
-	TotalChunks   int      `json:"totalChunks"`
-	OrphanedChunks int     `json:"orphanedChunks"`
-	DeletedChunks int      `json:"deletedChunks"`
-	Errors        []string `json:"errors,omitempty"`
+	MetadataFiles    int      `json:"metadataFiles"`
+	ReferencedChunks int      `json:"referencedChunks"`
+	TotalChunks      int      `json:"totalChunks"`
+	OrphanedChunks   int      `json:"orphanedChunks"`
+	DeletedChunks    int      `json:"deletedChunks"`
+	CacheSynced      bool     `json:"cacheSynced,omitempty"`
+	CacheEntriesBefore int    `json:"cacheEntriesBefore,omitempty"`
+	CacheEntriesAfter  int    `json:"cacheEntriesAfter,omitempty"`
+	Errors           []string `json:"errors,omitempty"`
 }
 
 // garbageCollect performs garbage collection on orphaned chunks
-func (f *Fs) garbageCollect(ctx context.Context, dryRun bool) (*GCStats, error) {
+func (f *Fs) garbageCollect(ctx context.Context, dryRun, syncCache bool) (*GCStats, error) {
 	stats := &GCStats{}
 	
 	// Step 1: Build set of all referenced chunks from metadata files
@@ -898,5 +1021,90 @@ func (f *Fs) garbageCollect(ctx context.Context, dryRun bool) (*GCStats, error) 
 		fs.Infof(f, "Deleted %d orphaned chunks out of %d total chunks", stats.DeletedChunks, stats.TotalChunks)
 	}
 	
+	// Step 3: Optionally synchronize chunk cache
+	if syncCache && f.chunkDB != nil && !dryRun {
+		fs.Infof(f, "Synchronizing chunk cache...")
+		err = f.syncChunkCache(ctx, referencedChunks, stats)
+		if err != nil {
+			stats.Errors = append(stats.Errors, fmt.Sprintf("Cache sync error: %v", err))
+		} else {
+			stats.CacheSynced = true
+			fs.Infof(f, "Cache synchronized: %d entries before, %d entries after", 
+				stats.CacheEntriesBefore, stats.CacheEntriesAfter)
+		}
+	}
+	
 	return stats, nil
+}
+
+// syncChunkCache removes stale entries from the chunk cache
+func (f *Fs) syncChunkCache(ctx context.Context, referencedChunks map[string]bool, stats *GCStats) error {
+	if f.chunkDB == nil {
+		return nil
+	}
+
+	// Count entries before
+	op := &chunkCacheCounter{}
+	if err := f.chunkDB.Do(false, op); err != nil {
+		return err
+	}
+	stats.CacheEntriesBefore = op.count
+
+	// Remove unreferenced chunks from cache
+	removeOp := &chunkCacheSyncer{referenced: referencedChunks}
+	if err := f.chunkDB.Do(true, removeOp); err != nil {
+		return err
+	}
+
+	// Count entries after
+	op = &chunkCacheCounter{}
+	if err := f.chunkDB.Do(false, op); err != nil {
+		return err
+	}
+	stats.CacheEntriesAfter = op.count
+
+	return nil
+}
+
+// chunkCacheCounter counts entries in the cache
+type chunkCacheCounter struct {
+	count int
+}
+
+func (op *chunkCacheCounter) Do(ctx context.Context, b kv.Bucket) error {
+	op.count = 0
+	return b.ForEach(func(k, v []byte) error {
+		op.count++
+		return nil
+	})
+}
+
+// chunkCacheSyncer removes unreferenced chunks from cache
+type chunkCacheSyncer struct {
+	referenced map[string]bool
+}
+
+func (op *chunkCacheSyncer) Do(ctx context.Context, b kv.Bucket) error {
+	var toDelete []string
+	
+	// First, collect keys to delete
+	err := b.ForEach(func(k, v []byte) error {
+		key := string(k)
+		if !op.referenced[key] {
+			toDelete = append(toDelete, key)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Then delete them
+	for _, key := range toDelete {
+		if err := b.Delete([]byte(key)); err != nil {
+			fs.Debugf(key, "Failed to remove from cache: %v", err)
+		}
+	}
+
+	return nil
 }

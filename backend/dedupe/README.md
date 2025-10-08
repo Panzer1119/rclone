@@ -37,12 +37,19 @@ rclone config create mydedup dedupe remote=myremote:path chunk_size=4M
 - `chunk_size`: Target size for chunks (default: 4M, min: 64K, max: 16M)
 - `hash_type`: Hash algorithm for chunk naming (default: sha256)
 - `store_full_hash`: Store hash of complete file in metadata (default: true)
+- `use_chunk_cache`: Use local persistent cache for chunk hashes (default: true, advanced)
 - `verify_hash`: Perform bit-for-bit comparison when chunk hash matches (default: false, advanced)
 
 The `store_full_hash` option (enabled by default) calculates and stores the hash of 
 the entire file in the metadata during upload. This allows the backend to immediately 
 provide the file hash when requested by upper layers, without having to read and 
 reconstruct the file from chunks.
+
+The `use_chunk_cache` option (enabled by default) maintains a local persistent database  
+(using BoltDB) of known chunk hashes. When uploading files, the backend first checks this
+cache before querying the underlying storage. This dramatically reduces API calls and 
+improves performance, especially for files with many chunks or when re-uploading similar
+content.
 
 The `verify_hash` option adds extra data integrity checking. When enabled, if a chunk 
 with the same hash already exists, the backend will read the existing chunk and compare 
@@ -102,13 +109,29 @@ rclone backend gc mydedup:
 
 # Dry-run to see what would be deleted without actually deleting
 rclone backend gc mydedup: -o dry-run=true
+
+# Also synchronize the chunk cache (removes stale entries)
+rclone backend gc mydedup: -o sync-cache=true
 ```
 
 The GC process:
 1. Scans all metadata files to build a set of referenced chunks
 2. Scans all stored chunks to identify orphans
 3. Deletes chunks that are not referenced (unless in dry-run mode)
-4. Returns statistics about the operation
+4. Optionally synchronizes the chunk cache to remove stale entries
+5. Returns statistics about the operation
+
+## Chunk Hash Cache
+
+The backend uses a local persistent cache (BoltDB) to track which chunks exist in storage.
+This cache:
+- **Improves Performance**: Avoids API calls to check if chunks already exist
+- **Persists Between Sessions**: Survives across rclone restarts
+- **Auto-Updates**: Automatically learns about chunks during uploads
+- **Can Be Synchronized**: Use `gc` with `--sync-cache` to clean stale entries
+- **Stored Locally**: Located in rclone's cache directory (platform-specific)
+
+To disable the cache: `rclone config create mydedup dedupe remote=s3:bucket use_chunk_cache=false`
 
 ## Technical Details
 
