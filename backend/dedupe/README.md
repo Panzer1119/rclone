@@ -36,7 +36,13 @@ rclone config create mydedup dedupe remote=myremote:path chunk_size=4M
 - `remote`: The underlying remote to store data (required)
 - `chunk_size`: Target size for chunks (default: 4M, min: 64K, max: 16M)
 - `hash_type`: Hash algorithm for chunk naming (default: sha256)
+- `store_full_hash`: Store hash of complete file in metadata (default: true)
 - `verify_hash`: Perform bit-for-bit comparison when chunk hash matches (default: false, advanced)
+
+The `store_full_hash` option (enabled by default) calculates and stores the hash of 
+the entire file in the metadata during upload. This allows the backend to immediately 
+provide the file hash when requested by upper layers, without having to read and 
+reconstruct the file from chunks.
 
 The `verify_hash` option adds extra data integrity checking. When enabled, if a chunk 
 with the same hash already exists, the backend will read the existing chunk and compare 
@@ -104,12 +110,15 @@ File metadata is stored as JSON:
     "abc123...",
     "def456..."
   ],
-  "chunkSize": 4194304
+  "chunkSize": 4194304,
+  "hash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 }
 ```
 
 The `version` field allows for future metadata format changes while maintaining 
-backward compatibility.
+backward compatibility. The `hash` field (when `store_full_hash` is enabled) 
+contains the SHA256 hash of the complete file, allowing fast hash retrieval 
+without reconstructing the file from chunks.
 
 ## Combining with Other Backends
 

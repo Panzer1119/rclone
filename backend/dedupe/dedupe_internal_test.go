@@ -49,6 +49,7 @@ func TestMetadataMarshalling(t *testing.T) {
 		ModTime:   time.Now(),
 		Chunks:    []string{"abc123", "def456"},
 		ChunkSize: 4194304,
+		Hash:      "fedcba9876543210", // Optional full file hash
 	}
 
 	// Test JSON marshalling/unmarshalling
@@ -65,6 +66,7 @@ func TestMetadataMarshalling(t *testing.T) {
 	assert.Equal(t, meta.Size, meta2.Size)
 	assert.Equal(t, len(meta.Chunks), len(meta2.Chunks))
 	assert.Equal(t, meta.ChunkSize, meta2.ChunkSize)
+	assert.Equal(t, meta.Hash, meta2.Hash)
 }
 
 // TestChunkReaderEmpty tests reading from empty metadata
@@ -216,4 +218,37 @@ func TestVerifyHashOption(t *testing.T) {
 		return
 	}
 	assert.True(t, f2.(*Fs).opt.VerifyHash)
+}
+
+// TestStoreFullHashOption tests the store_full_hash configuration option
+func TestStoreFullHashOption(t *testing.T) {
+	ctx := context.Background()
+
+	// Test with store_full_hash enabled (default)
+	m1 := configmap.Simple{
+		"remote":          ":memory:",
+		"chunk_size":      "1M",
+		"store_full_hash": "true",
+	}
+
+	f1, err := NewFs(ctx, "test", "", m1)
+	if err != nil {
+		t.Skip("Memory backend not available")
+		return
+	}
+	assert.True(t, f1.(*Fs).opt.StoreFullHash)
+
+	// Test with store_full_hash disabled
+	m2 := configmap.Simple{
+		"remote":          ":memory:",
+		"chunk_size":      "1M",
+		"store_full_hash": "false",
+	}
+
+	f2, err := NewFs(ctx, "test", "", m2)
+	if err != nil {
+		t.Skip("Memory backend not available")
+		return
+	}
+	assert.False(t, f2.(*Fs).opt.StoreFullHash)
 }

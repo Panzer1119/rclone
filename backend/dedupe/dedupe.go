@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"path"
 	"strings"
@@ -89,16 +90,26 @@ When enabled, if a chunk with the same hash already exists, the new chunk
 data will be compared byte-by-byte with the existing chunk to verify they 
 are truly identical. This adds overhead but provides extra data integrity 
 checking against hash collisions.`,
+		}, {
+			Name:     "store_full_hash",
+			Advanced: false,
+			Default:  true,
+			Help: `Store hash of the complete file in metadata.
+
+When enabled, the hash of the entire file is calculated and stored in the 
+metadata. This allows the backend to provide the file hash immediately 
+without having to read and reconstruct the file from chunks.`,
 		}},
 	})
 }
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote     string        `config:"remote"`
-	ChunkSize  fs.SizeSuffix `config:"chunk_size"`
-	HashType   string        `config:"hash_type"`
-	VerifyHash bool          `config:"verify_hash"`
+	Remote        string        `config:"remote"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
+	HashType      string        `config:"hash_type"`
+	VerifyHash    bool          `config:"verify_hash"`
+	StoreFullHash bool          `config:"store_full_hash"`
 }
 
 // Fs represents a dedupe filesystem
@@ -122,6 +133,7 @@ type FileMetadata struct {
 	ModTime   time.Time `json:"modTime"`
 	Chunks    []string  `json:"chunks"` // List of chunk hashes
 	ChunkSize int64     `json:"chunkSize"`
+	Hash      string    `json:"hash,omitempty"` // Hash of complete file (optional)
 }
 
 // Object represents a dedupe object
@@ -380,11 +392,16 @@ func (o *Object) Hash(ctx context.Context, ht fshash.Type) (string, error) {
 		return "", fshash.ErrUnsupported
 	}
 	
-	// Compute hash from chunk hashes
 	if o.metadata == nil {
 		return "", errors.New("no metadata available")
 	}
 	
+	// Return stored full file hash if available
+	if o.metadata.Hash != "" {
+		return o.metadata.Hash, nil
+	}
+	
+	// Fallback: compute hash from chunk hashes
 	h := sha256.New()
 	for _, chunkHash := range o.metadata.Chunks {
 		h.Write([]byte(chunkHash))
@@ -421,7 +438,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 // Update updates the object with new data
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	// Chunk the input using content-defined chunking
-	chunks, err := o.fs.chunkData(ctx, in)
+	result, err := o.fs.chunkData(ctx, in)
 	if err != nil {
 		return err
 	}
@@ -432,8 +449,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		Name:      o.remote,
 		Size:      src.Size(),
 		ModTime:   src.ModTime(ctx),
-		Chunks:    chunks,
+		Chunks:    result.Chunks,
 		ChunkSize: int64(o.fs.opt.ChunkSize),
+		Hash:      result.FullHash,
 	}
 	o.size = src.Size()
 	o.modTime = src.ModTime(ctx)
@@ -456,10 +474,29 @@ func (o *Object) Remove(ctx context.Context) error {
 	return metaObj.Remove(ctx)
 }
 
+// chunkResult holds the result of chunking operation
+type chunkResult struct {
+	Chunks   []string
+	FullHash string
+}
+
 // chunkData splits input data into content-defined chunks and stores them
-func (f *Fs) chunkData(ctx context.Context, in io.Reader) ([]string, error) {
+func (f *Fs) chunkData(ctx context.Context, in io.Reader) (*chunkResult, error) {
 	var chunks []string
-	chunker := newRabinChunker(in, int(f.opt.ChunkSize))
+	var fullHasher hash.Hash
+	
+	// Initialize full file hasher if option is enabled
+	if f.opt.StoreFullHash {
+		fullHasher = sha256.New()
+	}
+	
+	// Use TeeReader to hash the full file while chunking
+	var reader io.Reader = in
+	if fullHasher != nil {
+		reader = io.TeeReader(in, fullHasher)
+	}
+	
+	chunker := newRabinChunker(reader, int(f.opt.ChunkSize))
 
 	for {
 		chunk, err := chunker.Next()
@@ -483,7 +520,16 @@ func (f *Fs) chunkData(ctx context.Context, in io.Reader) ([]string, error) {
 		chunks = append(chunks, chunkHash)
 	}
 
-	return chunks, nil
+	result := &chunkResult{
+		Chunks: chunks,
+	}
+	
+	// Store full file hash if enabled
+	if fullHasher != nil {
+		result.FullHash = hex.EncodeToString(fullHasher.Sum(nil))
+	}
+
+	return result, nil
 }
 
 // storeChunk stores a chunk if it doesn't already exist

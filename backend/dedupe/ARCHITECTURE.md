@@ -46,9 +46,10 @@ The dedupe backend implements content-defined chunking and deduplication for rcl
 
 **Metadata Storage**:
 - JSON file per original file
-- Contains: version, filename, size, modTime, chunk list, chunk size
+- Contains: version, filename, size, modTime, chunk list, chunk size, optional full file hash
 - Mirrors original directory structure for easy navigation
 - Version field allows format evolution
+- Full file hash (when enabled) provides fast hash retrieval
 
 ### 3. Metadata Caching
 
